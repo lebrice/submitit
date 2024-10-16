@@ -25,11 +25,22 @@ def _get_plugins() -> Tuple[List[Type["Executor"]], List["JobEnvironment"]]:
 
     from ..local import debug, local
     from ..slurm import slurm
+    from ..slurm_remote import slurm_remote
 
     # TODO: use sys.modules.keys() and importlib.resources to find the files
     # We load both kind of entry points at the same time because we have to go through all module files anyway.
-    executors: List[Type["Executor"]] = [slurm.SlurmExecutor, local.LocalExecutor, debug.DebugExecutor]
-    job_envs = [slurm.SlurmJobEnvironment(), local.LocalJobEnvironment(), debug.DebugJobEnvironment()]
+    executors: List[Type["Executor"]] = [
+        slurm.SlurmExecutor,
+        local.LocalExecutor,
+        debug.DebugExecutor,
+        slurm_remote.RemoteSlurmExecutor,
+    ]
+    job_envs = [
+        slurm.SlurmJobEnvironment(),
+        local.LocalJobEnvironment(),
+        debug.DebugJobEnvironment(),
+        slurm_remote.RemoteSlurmJobEnvironment(),
+    ]
     for entry_point in pkg_resources.iter_entry_points("submitit"):
         if entry_point.name not in ("executor", "job_environment"):
             logger.warning(f"Found unknown entry point in package {entry_point.module_name}: {entry_point}")

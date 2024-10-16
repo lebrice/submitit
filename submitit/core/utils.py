@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import typing as tp
+from dataclasses import dataclass
 from pathlib import Path
 
 import cloudpickle
@@ -48,7 +49,10 @@ class JobPaths:
     """Creates paths related to the slurm job and its submission"""
 
     def __init__(
-        self, folder: tp.Union[Path, str], job_id: tp.Optional[str] = None, task_id: tp.Optional[int] = None
+        self,
+        folder: tp.Union[Path, str],
+        job_id: tp.Optional[str] = None,
+        task_id: tp.Optional[int] = None,
     ) -> None:
         self._folder = Path(folder).expanduser().absolute()
         self.job_id = job_id
@@ -106,14 +110,21 @@ class JobPaths:
         """Returns the closest folder which is id independent"""
         parts = Path(folder).expanduser().absolute().parts
         tags = ["%j", "%t", "%A", "%a"]
-        indep_parts = itertools.takewhile(lambda x: not any(tag in x for tag in tags), parts)
+        indep_parts = itertools.takewhile(
+            lambda x: not any(tag in x for tag in tags), parts
+        )
         return Path(*indep_parts)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.folder})"
 
 
-class DelayedSubmission:
+P = tp.ParamSpec("P")
+OutT = tp.TypeVar("OutT", covariant=True)
+
+
+@dataclass(init=False)
+class DelayedSubmission(tp.Generic[P, OutT]):
     """Object for specifying the function/callable call to submit and process later.
     This is only syntactic sugar to make sure everything is well formatted:
     If what you want to compute later is func(*args, **kwargs), just instanciate:
@@ -121,16 +132,23 @@ class DelayedSubmission:
     It also provides convenient tools for dumping and loading.
     """
 
-    def __init__(self, function: tp.Callable[..., tp.Any], *args: tp.Any, **kwargs: tp.Any) -> None:
+    function: tp.Callable[P, OutT]
+    args: tuple
+    kwargs: dict
+
+    def __init__(
+        self, function: tp.Callable[P, OutT], *args: P.args, **kwargs: P.kwargs
+    ) -> None:
         self.function = function
         self.args = args
         self.kwargs = kwargs
+
         self._result: tp.Any = None
         self._done = False
         self._timeout_min: int = 0
         self._timeout_countdown: int = 0  # controlled in submission and execution
 
-    def result(self) -> tp.Any:
+    def result(self) -> OutT:
         if self._done:
             return self._result
 
@@ -149,14 +167,16 @@ class DelayedSubmission:
         self._timeout_countdown = max_num_timeout
 
     @classmethod
-    def load(cls: tp.Type["DelayedSubmission"], filepath: tp.Union[str, Path]) -> "DelayedSubmission":
+    def load(cls: type[tp.Self], filepath: tp.Union[str, Path]) -> tp.Self:
         obj = pickle_load(filepath)
         # following assertion is relaxed compared to isinstance, to allow flexibility
         # (Eg: copying this class in a project to be able to have checkpointable jobs without adding submitit as dependency)
-        assert obj.__class__.__name__ == cls.__name__, f"Loaded object is {type(obj)} but should be {cls}."
+        assert (
+            obj.__class__.__name__ == cls.__name__
+        ), f"Loaded object is {type(obj)} but should be {cls}."
         return obj  # type: ignore
 
-    def _checkpoint_function(self) -> tp.Optional["DelayedSubmission"]:
+    def _checkpoint_function(self) -> tp.Self | None:
         checkpoint = getattr(self.function, "__submitit_checkpoint__", None)
         if checkpoint is None:
             checkpoint = getattr(self.function, "checkpoint", None)
@@ -189,10 +209,13 @@ def temporary_save_path(filepath: tp.Union[Path, str]) -> tp.Iterator[Path]:
 
 
 def archive_dev_folders(
-    folders: tp.List[tp.Union[str, Path]], outfile: tp.Optional[tp.Union[str, Path]] = None
+    folders: tp.List[tp.Union[str, Path]],
+    outfile: tp.Optional[tp.Union[str, Path]] = None,
 ) -> Path:
     """Creates a tar.gz file with all provided folders"""
-    assert isinstance(folders, (list, tuple)), "Only lists and tuples of folders are allowed"
+    assert isinstance(
+        folders, (list, tuple)
+    ), "Only lists and tuples of folders are allowed"
     if outfile is None:
         outfile = "_dev_folders_.tar.gz"
     outfile = Path(outfile)
@@ -239,7 +262,10 @@ def cloudpickle_dump(obj: tp.Any, filename: tp.Union[str, Path]) -> None:
 
 # pylint: disable=too-many-locals
 def copy_process_streams(
-    process: subprocess.Popen, stdout: io.StringIO, stderr: io.StringIO, verbose: bool = False
+    process: subprocess.Popen,
+    stdout: io.StringIO,
+    stderr: io.StringIO,
+    verbose: bool = False,
 ):
     """
     Reads the given process stdout/stderr and write them to StringIO objects.
@@ -324,7 +350,9 @@ class CommandFunction:
         Errors are provided with the internal stderr.
         """
         full_command = (
-            self.command + [str(x) for x in args] + [f"--{x}={y}" for x, y in kwargs.items()]
+            self.command
+            + [str(x) for x in args]
+            + [f"--{x}={y}" for x, y in kwargs.items()]
         )  # TODO bad parsing
         if self.verbose:
             print(f"The following command is sent: \"{' '.join(full_command)}\"")
@@ -340,7 +368,9 @@ class CommandFunction:
             stderr_buffer = io.StringIO()
 
             try:
-                copy_process_streams(process, stdout_buffer, stderr_buffer, self.verbose)
+                copy_process_streams(
+                    process, stdout_buffer, stderr_buffer, self.verbose
+                )
             except Exception as e:
                 process.kill()
                 process.wait()
