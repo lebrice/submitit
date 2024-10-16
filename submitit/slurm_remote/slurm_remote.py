@@ -168,7 +168,6 @@ class RemoteSlurmJobEnvironment(job_environment.JobEnvironment):
         super().__init__()
         self.cluster = self.name()
         self.cluster_hostname = cluster_hostname
-        # self.job_id = job_id
 
         self._login_node = None
         self._compute_node = None
@@ -252,7 +251,7 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         python: tp.Optional[str] = None,
     ) -> None:
         self.cluster = cluster
-        self.repo_dir = repo_dir
+        self.repo_dir = PurePosixPath(repo_dir)
         self._original_folder = folder  # save this argument that we'll modify.
         folder = Path(folder)
         assert not folder.is_absolute()
@@ -261,18 +260,7 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         )  # perhaps not necessary. (assuming %j or similar in the folder name atm.)
         self.login_node = RemoteV2(self.cluster)
 
-        if not (uv_path := self._get_uv_path()):
-            logger.info(
-                f"Setting up [uv](https://docs.astral.sh/uv/) on {self.cluster}"
-            )
-            self.login_node.run("curl -LsSf https://astral.sh/uv/install.sh | sh")
-            uv_path = self._get_uv_path()
-            if uv_path is None:
-                raise RuntimeError(
-                    f"Unable to setup `uv` on the {self.cluster} cluster!"
-                )
-
-        self._uv_path = uv_path
+        self._uv_path: str | None = None
 
         base_folder = get_first_id_independent_folder(folder)
         rest_of_folder = folder.relative_to(base_folder)
@@ -311,9 +299,39 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         )
         self.folder = self.local_folder
 
+        self._uv_path = self._setup_uv()
+        # TODOS:
+        # - Sync the source code using git?
+        if LocalV2.get_output("git status --porcelain", display=False):
+            print(
+                "You have uncommitted changes, please commit and push them before trying again."
+            )
+
+        # if LocalV2.get_output("git log --branches --not --remotes", display=False):
+        #     print("You unpushed branches! please push them before trying again.")
+
+        current_commit = LocalV2.run(f"cd {self.repo_dir} && git rev-parse HEAD")
+
+        self.login_node.run(
+            f"cd {self.repo_dir} && git fetch && git checkout {current_commit}",
+            display=True,
+        )
         self.update_parameters(
             srun_args=[f"--chdir={self.repo_dir}"], stderr_to_stdout=True
         )
+
+    def _setup_uv(self) -> str:
+        if not (uv_path := self._get_uv_path()):
+            logger.info(
+                f"Setting up [uv](https://docs.astral.sh/uv/) on {self.cluster}"
+            )
+            self.login_node.run("curl -LsSf https://astral.sh/uv/install.sh | sh")
+            uv_path = self._get_uv_path()
+            if uv_path is None:
+                raise RuntimeError(
+                    f"Unable to setup `uv` on the {self.cluster} cluster!"
+                )
+        return uv_path
 
     def _get_uv_path(self) -> str | None:
         return (
