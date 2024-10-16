@@ -7,6 +7,7 @@ import itertools
 import logging
 import shlex
 import subprocess
+import sys
 import typing as tp
 import uuid
 import warnings
@@ -167,7 +168,7 @@ class RemoteSlurmJobEnvironment(job_environment.JobEnvironment):
         super().__init__()
         self.cluster = self.name()
         self.cluster_hostname = cluster_hostname
-        self.job_id = job_id
+        # self.job_id = job_id
 
         self._login_node = None
         self._compute_node = None
@@ -258,7 +259,20 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         assert (
             len(folder.parts) >= 2
         )  # perhaps not necessary. (assuming %j or similar in the folder name atm.)
-        self.login_node = RemoteV2(cluster)
+        self.login_node = RemoteV2(self.cluster)
+
+        if not (uv_path := self._get_uv_path()):
+            logger.info(
+                f"Setting up [uv](https://docs.astral.sh/uv/) on {self.cluster}"
+            )
+            self.login_node.run("curl -LsSf https://astral.sh/uv/install.sh | sh")
+            uv_path = self._get_uv_path()
+            if uv_path is None:
+                raise RuntimeError(
+                    f"Unable to setup `uv` on the {self.cluster} cluster!"
+                )
+
+        self._uv_path = uv_path
 
         base_folder = get_first_id_independent_folder(folder)
         rest_of_folder = folder.relative_to(base_folder)
@@ -297,7 +311,23 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         )
         self.folder = self.local_folder
 
-        self.update_parameters(srun_args=[f"--chdir={self.repo_dir}"])
+        self.update_parameters(
+            srun_args=[f"--chdir={self.repo_dir}"], stderr_to_stdout=True
+        )
+
+    def _get_uv_path(self) -> str | None:
+        return (
+            LocalV2.get_output(
+                ("ssh", self.cluster, "bash", "-l", "which", "uv"), warn=True
+            ).strip()
+            or None
+        )
+
+    @property
+    def _submitit_command_str(self) -> str:
+        # Changed from the base class.
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        return f"{self._uv_path} run --python={python_version} python -u -m submitit.core._submit {shlex.quote(str(self.remote_folder))}"
 
     def _submit_command(self, command: str) -> core.Job:
         # Copied and adapted from PicklingExecutor.
@@ -367,6 +397,7 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         # scheduled as arrays.
         array_ex = type(self)(
             cluster=self.cluster,
+            repo_dir=self.repo_dir,
             folder=self._original_folder,
             max_num_timeout=self.max_num_timeout,
         )
@@ -390,11 +421,6 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         for job, pickle_path in zip(jobs, pickle_paths):
             job.paths.move_temporary_file(pickle_path, "submitted_pickle")
         return jobs
-
-    @property
-    def _submitit_command_str(self) -> str:
-        # Changed!
-        return f"uv run python -u -m submitit.core._submit {shlex.quote(str(self.remote_folder))}"
 
     def _make_submission_file_text(self, command: str, uid: str) -> str:
         # todo: there might still be issues with absolute paths with this folder here!

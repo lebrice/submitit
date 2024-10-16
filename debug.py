@@ -21,7 +21,7 @@ def add(a, b):
 # %j is replaced by the job id at runtime
 log_folder = "log_test/%j"
 executor = submitit.slurm_remote.RemoteSlurmExecutor(
-    cluster="mila", repo_rootdir="repos/submitit", folder=log_folder
+    cluster="mila", repo_dir="repos/submitit", folder=log_folder
 )
 # The AutoExecutor provides a simple abstraction over SLURM to simplify switching between local and slurm jobs (or other clusters if plugins are available).
 # specify sbatch parameters (here it will timeout after 4min, and run on dev)

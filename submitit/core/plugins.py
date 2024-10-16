@@ -39,7 +39,7 @@ def _get_plugins() -> Tuple[List[Type["Executor"]], List["JobEnvironment"]]:
         slurm.SlurmJobEnvironment(),
         local.LocalJobEnvironment(),
         debug.DebugJobEnvironment(),
-        slurm_remote.RemoteSlurmJobEnvironment(),
+        # slurm_remote.RemoteSlurmJobEnvironment(),
     ]
     for entry_point in pkg_resources.iter_entry_points("submitit"):
         if entry_point.name not in ("executor", "job_environment"):
