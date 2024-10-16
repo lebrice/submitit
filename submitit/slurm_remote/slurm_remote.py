@@ -306,15 +306,17 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
             print(
                 "You have uncommitted changes, please commit and push them before trying again."
             )
+            exit()
 
         # if LocalV2.get_output("git log --branches --not --remotes", display=False):
         #     print("You unpushed branches! please push them before trying again.")
 
-        current_commit = LocalV2.run(f"cd {self.repo_dir} && git rev-parse HEAD")
+        current_commit = LocalV2.get_output("git rev-parse HEAD")
 
-        self.login_node.run(
-            f"cd {self.repo_dir} && git fetch && git checkout {current_commit}",
-            display=True,
+        subprocess.check_call(
+            shlex.split(
+                f"ssh {self.cluster} cd {self.repo_dir} && git fetch && git checkout {current_commit}"
+            )
         )
         self.update_parameters(
             srun_args=[f"--chdir={self.repo_dir}"], stderr_to_stdout=True
