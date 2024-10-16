@@ -3,11 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 #
-import functools
-import inspect
+import itertools
 import logging
-import os
-import re
 import shlex
 import subprocess
 import typing as tp
@@ -15,15 +12,16 @@ import uuid
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import ClassVar
 
 from milatools.utils.compute_node import ComputeNode
+from milatools.utils.local_v2 import LocalV2
 from milatools.utils.remote_v2 import RemoteV2
 
 from ..core import core, job_environment, utils
 from ..slurm import slurm
-from ..slurm.slurm import SlurmInfoWatcher, SlurmJob, SlurmJobEnvironment
+from ..slurm.slurm import SlurmInfoWatcher, SlurmJobEnvironment
 
 logger = logging.getLogger(__name__)
 
@@ -34,17 +32,17 @@ class RemoteDir:
     remote_dir: PurePosixPath | str
     local_dir: Path
 
-    @contextmanager
-    def mount(self, unmount: bool = True):
+    def mount(self):
         self.login_node.run(f"mkdir -p {self.remote_dir}")
         self.local_dir.mkdir(exist_ok=True, parents=True)
         try:
-            subprocess.check_output(
-                [
+            LocalV2.run(
+                (
                     "sshfs",
                     f"{self.login_node.hostname}:{self.remote_dir}",
-                    self.local_dir,
-                ]
+                    str(self.local_dir),
+                ),
+                display=True,
             )
         except subprocess.CalledProcessError as e:
             if "fusermount3" in e.stderr:
@@ -52,12 +50,18 @@ class RemoteDir:
             else:
                 raise
 
-        yield
+        logger.info(
+            f"Remote dir {self.login_node.hostname}:{self.remote_dir} is now mounted at {self.local_dir}"
+        )
 
-        if unmount:
-            subprocess.check_call(
-                ("fusermount", "--unmount", self.local_dir),
-            )
+    def unmount(self):
+        LocalV2.run(("fusermount", "--unmount", str(self.local_dir)), display=True)
+
+    @contextmanager
+    def context(self):
+        self.mount()
+        yield
+        self.unmount()
 
 
 class RemoteSlurmInfoWatcher(SlurmInfoWatcher):
@@ -74,106 +78,14 @@ class RemoteSlurmInfoWatcher(SlurmInfoWatcher):
         return ["ssh", self.cluster] + cmd
 
 
-class RemoteJobPaths(utils.JobPaths):
-    """Creates paths related to the slurm job and its submission"""
-
-    def __init__(
-        self,
-        cluster: str,
-        folder: PurePosixPath | str,
-        job_id: str | None = None,
-        task_id: int | None = None,
-    ) -> None:
-        assert isinstance(folder, str) and folder.endswith("%j")
-        parent_folder = PurePosixPath(folder).parent
-        assert not parent_folder.is_absolute()
-
-        self.local_folder = f"{cluster}_{folder}"
-
-        # Check if the parent folder is already mounted to that remote?
-        # Mount it with sshfs (via a subprocess call) if not
-        try:
-            subprocess.check_output(
-                ["sshfs", cluster + ":" + str(parent_folder), self.local_folder]
-            )
-        except subprocess.CalledProcessError as e:
-            if "fusermount3" in e.stderr:
-                pass  # All good, it's already mounted.
-            else:
-                raise
-
-        self.cluster = cluster
-        self._folder = Path(self.local_folder)
-
-        self.job_id = job_id
-        self.task_id = task_id or 0
-
-    def __del__(self):
-        subprocess.check_call(
-            ("fusermount", "--unmount", self.local_folder),
-        )
-
-    @property
-    def folder(self) -> Path:
-        return self._format_id(self._folder)
-
-    @property
-    def submission_file(self) -> Path:
-        if self.job_id and "_" in self.job_id:
-            # We only have one submission file per job array
-            return self._format_id(self.folder / "%A_submission.sh")
-        return self._format_id(self.folder / "%j_submission.sh")
-
-    @property
-    def submitted_pickle(self) -> Path:
-        return self._format_id(self.folder / "%j_submitted.pkl")
-
-    @property
-    def result_pickle(self) -> Path:
-        return self._format_id(self.folder / "%j_%t_result.pkl")
-
-    @property
-    def stderr(self) -> Path:
-        return self._format_id(self.folder / "%j_%t_log.err")
-
-    @property
-    def stdout(self) -> Path:
-        return self._format_id(self.folder / "%j_%t_log.out")
-
-    def _format_id(self, path: Path | str) -> Path:
-        """Replace id tag by actual id if available"""
-        if self.job_id is None:
-            return Path(path)
-        replaced_path = (
-            str(path).replace("%j", str(self.job_id)).replace("%t", str(self.task_id))
-        )
-        array_id, *array_index = str(self.job_id).split("_", 1)
-        if "%a" in replaced_path:
-            if len(array_index) != 1:
-                raise ValueError("%a is in the folder path but this is not a job array")
-            replaced_path = replaced_path.replace("%a", array_index[0])
-        return PurePosixPath(replaced_path.replace("%A", array_id))
-
-    def move_temporary_file(
-        self, tmp_path: tp.Union[Path, str], name: str, keep_as_symlink: bool = False
-    ) -> None:
-        self.folder.mkdir(parents=True, exist_ok=True)
-        Path(tmp_path).rename(getattr(self, name))
-        if keep_as_symlink:
-            Path(tmp_path).symlink_to(getattr(self, name))
-
-    @staticmethod
-    def get_first_id_independent_folder(folder: tp.Union[Path, str]) -> Path:
-        """Returns the closest folder which is id independent"""
-        parts = Path(folder).expanduser().absolute().parts
-        tags = ["%j", "%t", "%A", "%a"]
-        indep_parts = itertools.takewhile(
-            lambda x: not any(tag in x for tag in tags), parts
-        )
-        return Path(*indep_parts)
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.folder})"
+def get_first_id_independent_folder(folder: tp.Union[PurePath, str]) -> PurePosixPath:
+    """Returns the closest folder which is id independent"""
+    parts = PurePath(folder).parts
+    tags = ["%j", "%t", "%A", "%a"]
+    indep_parts = itertools.takewhile(
+        lambda x: not any(tag in x for tag in tags), parts
+    )
+    return PurePosixPath(*indep_parts)
 
 
 class RemoteSlurmJob(core.Job[core.R]):
@@ -236,42 +148,6 @@ def _expand_id_suffix(suffix_parts: str) -> tp.List[str]:
     return suffixes
 
 
-def _parse_node_group(node_list: str, pos: int, parsed: tp.List[str]) -> int:
-    """Parse a node group of the form PREFIX[1-3,5,8] and return
-    the position in the string at which the parsing stopped
-    """
-    prefixes = [""]
-    while pos < len(node_list):
-        c = node_list[pos]
-        if c == ",":
-            parsed.extend(prefixes)
-            return pos + 1
-        if c == "[":
-            last_pos = node_list.index("]", pos)
-            suffixes = _expand_id_suffix(node_list[pos + 1 : last_pos])
-            prefixes = [prefix + suffix for prefix in prefixes for suffix in suffixes]
-            pos = last_pos + 1
-        else:
-            for i, prefix in enumerate(prefixes):
-                prefixes[i] = prefix + c
-            pos += 1
-    parsed.extend(prefixes)
-    return pos
-
-
-def _parse_node_list(node_list: str):
-    try:
-        pos = 0
-        parsed: tp.List[str] = []
-        while pos < len(node_list):
-            pos = _parse_node_group(node_list, pos, parsed)
-        return parsed
-    except ValueError as e:
-        raise slurm.SlurmParseException(
-            f"Unrecognized format for SLURM_JOB_NODELIST: '{node_list}'", e
-        ) from e
-
-
 class RemoteSlurmJobEnvironment(job_environment.JobEnvironment):
     _env = {
         "job_id": "SLURM_JOB_ID",
@@ -314,7 +190,7 @@ class RemoteSlurmJobEnvironment(job_environment.JobEnvironment):
     def _requeue(self, countdown: int) -> None:
         jid = self.job_id
         self.login_node.run(f"scontrol requeue {jid}")  # timeout=60)
-        logger.get_logger().info(f"Requeued job {jid} ({countdown} remaining timeouts)")
+        logger.info(f"Requeued job {jid} ({countdown} remaining timeouts)")
 
     @property
     def hostnames(self) -> list[str]:
@@ -328,11 +204,10 @@ class RemoteSlurmJobEnvironment(job_environment.JobEnvironment):
         Link: https://hpcc.umd.edu/hpcc/help/slurmenv.html
         """
         node_list = self.compute_node.get_output(f"echo {self._env['nodes']}")
-        # node_list = subprocess.check_output(("ssh", self.cluster, "srun")
-        node_list = os.environ.get(self._env["nodes"], "")
         if not node_list:
-            return [self.hostname]
-        return _parse_node_list(node_list)
+            # return [self.hostname]
+            raise NotImplementedError("TODO: what is this case meant to represent?")
+        return slurm._parse_node_list(node_list)
 
 
 class RemoteSlurmExecutor(slurm.SlurmExecutor):
@@ -365,87 +240,105 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
       input erroneous parameters, an error will print all parameters available for you.
     """
 
-    job_class = SlurmJob
+    job_class: ClassVar[type[RemoteSlurmJob]] = RemoteSlurmJob
 
     def __init__(
         self,
         cluster: str,
+        repo_dir: str | PurePosixPath,
         folder: tp.Union[Path, str],
         max_num_timeout: int = 3,
         python: tp.Optional[str] = None,
     ) -> None:
         self.cluster = cluster
+        self.repo_dir = repo_dir
         self._original_folder = folder  # save this argument that we'll modify.
         folder = Path(folder)
         assert not folder.is_absolute()
-
-        self.local_folder = cluster / folder
-
+        assert (
+            len(folder.parts) >= 2
+        )  # perhaps not necessary. (assuming %j or similar in the folder name atm.)
         self.login_node = RemoteV2(cluster)
-        self.remote_dir = self.login_node.get_output("echo $SCRATCH") / PurePosixPath(
-            folder
-        )
 
-        self.remote_dir = RemoteDir(
+        base_folder = get_first_id_independent_folder(folder)
+        rest_of_folder = folder.relative_to(base_folder)
+        # Example: `folder="logs_test/%j"`
+        # Locally:
+        # ./logs_test/mila/%j
+        # Remote:
+        # $SCRATCH/logs_test/%j
+
+        # "base" folder := dir without any %j %t, %A, etc.
+        self.local_base_folder = Path(base_folder / cluster)
+        self.local_folder = self.local_base_folder / rest_of_folder
+
+        # todo: include our hostname / something unique so we don't overwrite anything on the remote?
+        self.remote_base_folder = (
+            PurePosixPath(self.login_node.get_output("echo $SCRATCH"))
+            / ".submitit"
+            / base_folder
+        )
+        self.remote_folder = self.remote_base_folder / rest_of_folder
+
+        self.remote_dir_mount: RemoteDir | None = RemoteDir(
             self.login_node,
-            remote_dir=self.remote_dir,
-            local_dir=self.local_folder,
+            remote_dir=self.remote_base_folder,
+            local_dir=self.local_base_folder,
         )
-
+        self.remote_dir_mount.mount()
         super().__init__(
-            self.local_folder, max_num_timeout=max_num_timeout, python=python
+            folder=self.local_folder, max_num_timeout=max_num_timeout, python=python
         )
+        # No need to make it absolute. Revert it back to a relative path?
+        assert not self.local_folder.is_absolute()
+        assert self.folder == self.local_folder.absolute(), (
+            self.folder,
+            self.local_folder.absolute(),
+        )
+        self.folder = self.local_folder
 
-    def _internal_update_parameters(self, **kwargs: tp.Any) -> None:
-        """Updates sbatch submission file parameters
-
-        Parameters
-        ----------
-        See slurm documentation for most parameters.
-        Most useful parameters are: time, mem, gpus_per_node, cpus_per_task, partition
-        Below are the parameters that differ from slurm documentation:
-
-        signal_delay_s: int
-            delay between the kill signal and the actual kill of the slurm job.
-        setup: list
-            a list of command to run in sbatch befure running srun
-        array_parallelism: int
-            number of map tasks that will be executed in parallel
-
-        Raises
-        ------
-        ValueError
-            In case an erroneous keyword argument is added, a list of all eligible parameters
-            is printed, with their default values
-
-        Note
-        ----
-        Best practice (as far as Quip is concerned): cpus_per_task=2x (number of data workers + gpus_per_task)
-        You can use cpus_per_gpu=2 (requires using gpus_per_task and not gpus_per_node)
-        """
-        return super()._internal_update_parameters(**kwargs)
+        self.update_parameters(srun_args=[f"--chdir={self.repo_dir}"])
 
     def _submit_command(self, command: str) -> core.Job:
-        # Copied from PicklingExecutor.
-
+        # Copied and adapted from PicklingExecutor.
         tmp_uuid = uuid.uuid4().hex
-        submission_file_path = (
-            utils.JobPaths.get_first_id_independent_folder(self.folder)
-            / f".submission_file_{tmp_uuid}.sh"
+        local_submission_file_path = Path(
+            self.local_base_folder / f".submission_file_{tmp_uuid}.sh"
         )
-        with submission_file_path.open("w") as f:
+        remote_submission_file_path = (
+            self.remote_base_folder / f".submission_file_{tmp_uuid}.sh"
+        )
+
+        with local_submission_file_path.open("w") as f:
             f.write(self._make_submission_file_text(command, tmp_uuid))
-        command_list = self._make_submission_command(submission_file_path)
-        # run
+
+        # remote_content = self.login_node.get_output(
+        #     f"cat {remote_submission_file_path}"
+        # )
+        # local_content = local_submission_file_path.read_text()
+
+        command_list = self._make_submission_command(remote_submission_file_path)
+
         output = utils.CommandFunction(command_list, verbose=False)()  # explicit errors
         job_id = self._get_job_id_from_submission_command(output)
         tasks_ids = list(range(self._num_tasks()))
-        job: Job[tp.Any] = self.job_class(
-            folder=self.folder, job_id=job_id, tasks=tasks_ids
+
+        job = self.job_class(
+            cluster=self.cluster,
+            folder=self.local_folder,
+            job_id=job_id,
+            tasks=tasks_ids,
         )
-        job.paths.move_temporary_file(
-            submission_file_path, "submission_file", keep_as_symlink=True
-        )
+        # Equivalent of `_move_temporarity_file` call (expanded to be more explicit):
+        # job.paths.move_temporary_file(
+        #     local_submission_file_path, "submission_file", keep_as_symlink=True
+        # )
+        # Local submission file.
+        job.paths.submission_file.parent.mkdir(parents=True, exist_ok=True)
+        local_submission_file_path.rename(job.paths.submission_file)
+        # Might not work!
+        local_submission_file_path.symlink_to(job.paths.submission_file)
+        # TODO: The rest here isn't used?
         self._write_job_id(job.job_id, tmp_uuid)
         self._set_job_permissions(job.paths.folder)
         return job
@@ -456,7 +349,9 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         logger.info(f"Processing {len(delayed_submissions)} submissions")
         logger.debug(delayed_submissions[0])
         if len(delayed_submissions) == 1:
+            # TODO: Why is this case here?
             return super()._internal_process_submissions(delayed_submissions)
+
         # array
         folder = utils.JobPaths.get_first_id_independent_folder(self.folder)
         folder.mkdir(parents=True, exist_ok=True)
@@ -498,36 +393,26 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
 
     @property
     def _submitit_command_str(self) -> str:
-        return " ".join(
-            [self.python, "-u -m submitit.core._submit", shlex.quote(str(self.folder))]
-        )
+        # Changed!
+        return f"uv run python -u -m submitit.core._submit {shlex.quote(str(self.remote_folder))}"
 
     def _make_submission_file_text(self, command: str, uid: str) -> str:
+        # todo: there might still be issues with absolute paths with this folder here!
         return _make_sbatch_string(
-            command=command, folder=self.folder, **self.parameters
+            command=command, folder=self.remote_folder, **self.parameters
         )
+        # content_with_remote_paths = content_with_local_paths.replace(
+        #     str(self.local_base_folder.absolute()), str(self.remote_base_folder)
+        # )
+        # return content_with_remote_paths
 
     def _num_tasks(self) -> int:
         nodes: int = self.parameters.get("nodes", 1)
         tasks_per_node: int = max(1, self.parameters.get("ntasks_per_node", 1))
         return nodes * tasks_per_node
 
-    def _make_submission_command(self, submission_file_path: Path) -> tp.List[str]:
+    def _make_submission_command(self, submission_file_path: PurePath) -> tp.List[str]:
         return ["ssh", self.cluster, "sbatch", str(submission_file_path)]
-
-    @staticmethod
-    def _get_job_id_from_submission_command(string: tp.Union[bytes, str]) -> str:
-        """Returns the job ID from the output of sbatch string"""
-        if not isinstance(string, str):
-            string = string.decode()
-        output = re.search(r"job (?P<id>[0-9]+)", string)
-        if output is None:
-            raise utils.FailedSubmissionError(
-                f'Could not make sense of sbatch output "{string}"\n'
-                "Job instance will not be able to fetch status\n"
-                "(you may however set the job job_id manually if needed)"
-            )
-        return output.group("id")
 
     @classmethod
     def affinity(cls) -> int:
@@ -535,20 +420,10 @@ class RemoteSlurmExecutor(slurm.SlurmExecutor):
         # return -1 if shutil.which("srun") is None else 2
 
 
-@functools.lru_cache()
-def _get_default_parameters() -> tp.Dict[str, tp.Any]:
-    """Parameters that can be set through update_parameters"""
-    specs = inspect.getfullargspec(_make_sbatch_string)
-    zipped = zip(specs.args[-len(specs.defaults) :], specs.defaults)  # type: ignore
-    return {
-        key: val for key, val in zipped if key not in {"command", "folder", "map_count"}
-    }
-
-
 # pylint: disable=too-many-arguments,unused-argument, too-many-locals
 def _make_sbatch_string(
     command: str,
-    folder: tp.Union[str, Path],
+    folder: tp.Union[str, PurePath],
     job_name: str = "submitit",
     partition: tp.Optional[str] = None,
     time: int = 5,
@@ -645,9 +520,9 @@ def _make_sbatch_string(
     # Local paths to read from?
 
     # Paths to put in the sbatch file
-    paths = utils.JobPaths(folder=folder)
-    stdout = str(paths.stdout)
-    stderr = str(paths.stderr)
+    # paths = utils.JobPaths(folder=folder)  # changed!
+    stdout = str(PurePosixPath(folder) / "%j_%t_log.out")  # changed!
+    stderr = str(PurePosixPath(folder) / "%j_%t_log.err")  # changed!
     # Job arrays will write files in the form  <ARRAY_ID>_<ARRAY_TASK_ID>_<TASK_ID>
     if map_count is not None:
         assert isinstance(map_count, int) and map_count

@@ -20,7 +20,9 @@ def add(a, b):
 # The specified folder is used to dump job information, logs and result when finished
 # %j is replaced by the job id at runtime
 log_folder = "log_test/%j"
-executor = submitit.slurm_remote.RemoteSlurmExecutor(cluster="mila", folder=log_folder)
+executor = submitit.slurm_remote.RemoteSlurmExecutor(
+    cluster="mila", repo_rootdir="repos/submitit", folder=log_folder
+)
 # The AutoExecutor provides a simple abstraction over SLURM to simplify switching between local and slurm jobs (or other clusters if plugins are available).
 # specify sbatch parameters (here it will timeout after 4min, and run on dev)
 # This is where you would specify `gpus_per_node=1` for instance
